@@ -810,5 +810,22 @@ namespace DotNetty.Buffers.Tests
             ReferenceCountUtil.Release(buffer);
             Assert.Equal(0, buffer.ReferenceCount);
         }
+
+        [Fact]
+        public void AllocatorIsSameWhenCopy() => this.AllocatorIsSameWhenCopy0(false);
+
+        [Fact]
+        public void AllocatorIsSameWhenCopyUsingIndexAndLength() => this.AllocatorIsSameWhenCopy0(true);
+
+        void AllocatorIsSameWhenCopy0(bool withIndexAndLength)
+        {
+            IByteBuffer buffer = this.NewBuffer(8);
+            buffer.WriteZero(4);
+            IByteBuffer copy = withIndexAndLength ? buffer.Copy(0, 4) : buffer.Copy();
+            Assert.Equal(buffer, copy);
+            Assert.Same(buffer.Allocator, copy.Allocator);
+            buffer.Release();
+            copy.Release();
+        }
     }
 }

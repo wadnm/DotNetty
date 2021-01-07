@@ -19,7 +19,7 @@ var configuration = IsRunningOnWindows() ? "Release" : "MonoRelease";
 var csProjectFiles = GetFiles("./src/**/*.csproj");
 
 // Directories
-var nuget = Directory(".nuget");
+var nuget = Directory("tools");
 var output = Directory("build");
 var outputBinaries = output + Directory("binaries");
 var outputBinariesNet45 = outputBinaries + Directory("net45");
@@ -66,7 +66,7 @@ Task("Compile")
   .Does(() =>
 {
 
-  int result = StartProcess("dotnet", new ProcessSettings { Arguments = "msbuild dotnetty.sln /p:Configuration=" + configuration } );
+  int result = StartProcess("dotnet", new ProcessSettings { Arguments = "msbuild DotNetty.sln /p:Configuration=" + configuration } );
   if (result != 0)
   {
     throw new CakeException($"Compilation failed.");
@@ -155,7 +155,7 @@ Task("Publish-NuGet")
   foreach(var package in packages)
   {
     NuGetPush(package, new NuGetPushSettings {
-      ToolPath = ".nuget/nuget.exe",
+      ToolPath = "tools/nuget.exe",
       Source = source,
       ApiKey = apiKey,
       Verbosity = NuGetVerbosity.Detailed
@@ -179,6 +179,8 @@ Task("Benchmark")
   {
     Information("Using NBench.Runner: {0}", lib);
 
+	// Make sure libuv.dll exists in performance test folder
+    CopyFiles("./test/DotNetty.Transport.Libuv.Tests/bin/"  + configuration + "/net452/win-x64/libuv.dll", lib.GetDirectory(), false);
     CopyFiles("./tools/NBench.Runner*/**/NBench.Runner.exe", lib.GetDirectory(), false);
     
     var nbenchArgs = new StringBuilder()
