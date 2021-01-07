@@ -126,6 +126,10 @@ namespace DotNetty.Transport.Channels.Sockets
                 var eventPayload = new SocketChannelAsyncOperation(this, false);
                 eventPayload.RemoteEndPoint = remoteAddress;
                 bool connected = !this.Socket.ConnectAsync(eventPayload);
+                if (connected)
+                {
+                    this.DoFinishConnect(eventPayload);
+                }
                 success = true;
                 return connected;
             }
@@ -166,9 +170,12 @@ namespace DotNetty.Transport.Channels.Sockets
         {
             try
             {
-                if (this.TryResetState(StateFlags.Open | StateFlags.Active))
+                if (this.TryResetState(StateFlags.Open))
                 {
-                    this.Socket.Shutdown(SocketShutdown.Both);
+                    if (this.TryResetState(StateFlags.Active))
+                    {
+                        this.Socket.Shutdown(SocketShutdown.Both);
+                    }
                     this.Socket.Dispose();
                 }
             }
@@ -190,8 +197,7 @@ namespace DotNetty.Transport.Channels.Sockets
                 return -1; // prevents ObjectDisposedException from being thrown in case connection has been lost in the meantime
             }
 
-            SocketError errorCode;
-            int received = this.Socket.Receive(byteBuf.Array, byteBuf.ArrayOffset + byteBuf.WriterIndex, byteBuf.WritableBytes, SocketFlags.None, out errorCode);
+            int received = this.Socket.Receive(byteBuf.Array, byteBuf.ArrayOffset + byteBuf.WriterIndex, byteBuf.WritableBytes, SocketFlags.None, out SocketError errorCode);
 
             switch (errorCode)
             {
@@ -223,8 +229,7 @@ namespace DotNetty.Transport.Channels.Sockets
                 throw new NotImplementedException("Only IByteBuffer implementations backed by array are supported.");
             }
 
-            SocketError errorCode;
-            int sent = this.Socket.Send(buf.Array, buf.ArrayOffset + buf.ReaderIndex, buf.ReadableBytes, SocketFlags.None, out errorCode);
+            int sent = this.Socket.Send(buf.Array, buf.ArrayOffset + buf.ReaderIndex, buf.ReadableBytes, SocketFlags.None, out SocketError errorCode);
 
             if (errorCode != SocketError.Success && errorCode != SocketError.WouldBlock)
             {
@@ -252,7 +257,7 @@ namespace DotNetty.Transport.Channels.Sockets
             {
                 while (true)
                 {
-                    int size = input.Count;
+                    int size = input.Size;
                     if (size == 0)
                     {
                         // All written
@@ -262,7 +267,8 @@ namespace DotNetty.Transport.Channels.Sockets
                     bool done = false;
 
                     // Ensure the pending writes are made of ByteBufs only.
-                    sharedBufferList = input.GetSharedBufferList(1024);
+                    int maxBytesPerGatheringWrite = ((TcpSocketChannelConfig)this.config).GetMaxBytesPerGatheringWrite();
+                    sharedBufferList = input.GetSharedBufferList(1024, maxBytesPerGatheringWrite);
                     int nioBufferCnt = sharedBufferList.Count;
                     long expectedWrittenBytes = input.NioBufferSize;
                     Socket socket = this.Socket;
@@ -279,8 +285,7 @@ namespace DotNetty.Transport.Channels.Sockets
                         default:
                             for (int i = this.Configuration.WriteSpinCount - 1; i >= 0; i--)
                             {
-                                SocketError errorCode;
-                                long localWrittenBytes = socket.Send(bufferList, SocketFlags.None, out errorCode);
+                                long localWrittenBytes = socket.Send(bufferList, SocketFlags.None, out SocketError errorCode);
                                 if (errorCode != SocketError.Success && errorCode != SocketError.WouldBlock)
                                 {
                                     throw new SocketException((int)errorCode);
@@ -308,15 +313,20 @@ namespace DotNetty.Transport.Channels.Sockets
 
                     if (writtenBytes > 0)
                     {
-                        // Release the fully written buffers, and update the indexes of the partially written buffer.
+                        // Release the fully written buffers, and update the indexes of the partially written buffer
                         input.RemoveBytes(writtenBytes);
                     }
 
                     if (!done)
                     {
-                        SocketChannelAsyncOperation asyncOperation = this.PrepareWriteOperation(bufferList);
+                        IList<ArraySegment<byte>> asyncBufferList = bufferList;
+                        if (object.ReferenceEquals(sharedBufferList, asyncBufferList))
+                        {
+                            asyncBufferList = sharedBufferList.ToArray(); // move out of shared list that will be reused which could corrupt buffers still pending update
+                        }
+                        SocketChannelAsyncOperation asyncOperation = this.PrepareWriteOperation(asyncBufferList);
 
-                        // Did not write all buffers completely.
+                        // Not all buffers were written out completely
                         if (this.IncompleteWrite(true, asyncOperation))
                         {
                             break;
@@ -326,13 +336,14 @@ namespace DotNetty.Transport.Channels.Sockets
             }
             finally
             {
+                // Prepare the list for reuse
                 sharedBufferList?.Clear();
             }
         }
 
         List<ArraySegment<byte>> AdjustBufferList(long localWrittenBytes, List<ArraySegment<byte>> bufferList)
         {
-            var adjustbufferList = new List<ArraySegment<byte>>(bufferList.Count);
+            var adjusted = new List<ArraySegment<byte>>(bufferList.Count);
             foreach (ArraySegment<byte> buffer in bufferList)
             {
                 if (localWrittenBytes > 0)
@@ -342,7 +353,7 @@ namespace DotNetty.Transport.Channels.Sockets
                     {
                         int offset = buffer.Offset + (int)localWrittenBytes;
                         int count = -(int)leftBytes;
-                        adjustbufferList.Add(new ArraySegment<byte>(buffer.Array, offset, count));
+                        adjusted.Add(new ArraySegment<byte>(buffer.Array, offset, count));
                         localWrittenBytes = 0;
                     }
                     else
@@ -352,11 +363,10 @@ namespace DotNetty.Transport.Channels.Sockets
                 }
                 else
                 {
-                    adjustbufferList.Add(buffer);
+                    adjusted.Add(buffer);
                 }
             }
-            bufferList = adjustbufferList;
-            return bufferList;
+            return adjusted;
         }
 
         protected override IChannelUnsafe NewUnsafe() => new TcpSocketChannelUnsafe(this);
@@ -381,9 +391,34 @@ namespace DotNetty.Transport.Channels.Sockets
 
         sealed class TcpSocketChannelConfig : DefaultSocketChannelConfiguration
         {
+            volatile int maxBytesPerGatheringWrite = int.MaxValue;
+
             public TcpSocketChannelConfig(TcpSocketChannel channel, Socket javaSocket)
                 : base(channel, javaSocket)
             {
+                this.CalculateMaxBytesPerGatheringWrite();
+            }
+
+            public int GetMaxBytesPerGatheringWrite() => this.maxBytesPerGatheringWrite;
+
+            public override int SendBufferSize
+            {
+                get => base.SendBufferSize;
+                set
+                {
+                    base.SendBufferSize = value;
+                    this.CalculateMaxBytesPerGatheringWrite();
+                }
+            }
+
+            void CalculateMaxBytesPerGatheringWrite()
+            {
+                // Multiply by 2 to give some extra space in case the OS can process write data faster than we can provide.
+                int newSendBufferSize = this.SendBufferSize << 1;
+                if (newSendBufferSize > 0)
+                {
+                    this.maxBytesPerGatheringWrite = newSendBufferSize;
+                }
             }
 
             protected override void AutoReadCleared() => ((TcpSocketChannel)this.Channel).ClearReadPending();
